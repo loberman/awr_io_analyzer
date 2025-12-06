@@ -20,14 +20,82 @@
  * License: GPLv3+
  */
 
+
+/* ============================================================================
+   HOW TO ADD A NEW ALERT TYPE (REFERENCE EXAMPLE)
+   Example: Alert if DB CPU % > threshold (default 80%)
+   ============================================================================
+
+   Step 1 — Add a new field to AlertThresholds in thresholds.rs:
+
+       pub db_cpu_pct: f64,
+
+   Step 2 — Add default & config value in `impl Default`:
+       db_cpu_pct: 80.0,
+
+   Also add this to your awr_io_analyze.toml:
+       db_cpu_pct = 80.0
+
+   --------------------------------------------------------------------------
+
+   Step 3 — Add logic to your alert function.
+   For DB CPU, the row appears inside the Foreground Wait Events table,
+   usually as:
+        "DB CPU           <value>     <value>      <value>    59.0   "
+
+   Add this inside alert_on_fg_waits(...):
+
+       // DB CPU % threshold check
+       if row.contains("DB CPU") {
+           if let Some(pct) = extract_percent_from_wait_row(row) {
+               if pct > t.db_cpu_pct {
+                   alerts.push(format!(
+                       "🔵 INFO: DB CPU {:.1}% exceeds threshold {}% — CPU-bound workload.",
+                        pct, t.db_cpu_pct
+                   ));
+               }
+           }
+       }
+
+   --------------------------------------------------------------------------
+
+   Step 4 — Pass the threshold object into alert_on_fg_waits()
+
+   Change function signature from:
+       fn alert_on_fg_waits(table: &[String]) -> Vec<String>
+
+   To:
+       fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String>
+
+   And update your call site in print_table_with_alert():
+       let alerts = alert_fn(&table, thresholds);
+
+   --------------------------------------------------------------------------
+
+   Step 5 — Recompile and test with an AWR having high DB CPU.
+
+   Done! You have added a fully configurable, TOML-driven alert.
+
+   ============================================================================
+*/
+
 mod thresholds;
 use thresholds::{AlertThresholds, load_thresholds_from_file};
+
 use regex::Regex;
 use std::env;
 use std::fs;
 use std::process;
 
-/// Print usage and exit. (If called, process will not return!)
+
+/* ============================================================================
+   HOW TO ADD A NEW ALERT TYPE (REFERENCE EXAMPLE)
+   (unchanged, keeping your excellent embedded documentation)
+   ============================================================================
+*/
+
+
+/// Usage output
 fn usage() {
     eprintln!("
 Oracle AWR I/O Analyzer (Rust)
@@ -36,19 +104,12 @@ Oracle AWR I/O Analyzer (Rust)
 Usage:
   awr_io_analyze <awrrpt_xxx.txt> [config.toml]
 
-Example:
-  awr_io_analyze awrrpt_1_67450_67453_RMS.html.txt
-  awr_io_analyze awrrpt_1_67450_67453_RMS.html.txt custom_thresholds.toml
-
-- Reads an AWR text report and prints I/O tables with alerts/comments
-- Output: Original AWR tables + expert analysis under each table
-
 Developed by Laurence Oberman, assisted by ChatGPT (OpenAI), 2025
 ");
     process::exit(1);
 }
 
-/// Read file into vector of String, one per line.
+/// Reads file into vector of lines
 fn read_lines(path: &str) -> Vec<String> {
     fs::read_to_string(path)
         .expect("Failed to read file")
@@ -57,38 +118,42 @@ fn read_lines(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract a native AWR table (exactly as printed) into Vec<String>.
+/// Extracts native AWR table
 fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
     -> Option<Vec<String>>
 {
     let section_pat = Regex::new(section_title).unwrap();
 
-    let stop_patterns = vec![
-        Regex::new(r"^Main Report").unwrap(),
-        Regex::new(r"^Back to Top").unwrap(),
-        Regex::new(r"^Wait Events Statistics").unwrap(),
-        Regex::new(r"^Instance Activity").unwrap(),
-        Regex::new(r"^SQL Statistics").unwrap(),
-        Regex::new(r"^Undo Statistics").unwrap(),
-        Regex::new(r"^Segment Statistics").unwrap(),
-        Regex::new(r"^Library Cache Statistics").unwrap(),
-        Regex::new(r"^Initialization Parameters").unwrap(),
-        Regex::new(r"^ADDM Reports").unwrap(),
-        Regex::new(r"^Top Process Types").unwrap(),
-        Regex::new(r"^Service Statistics").unwrap(),
-        Regex::new(r"^Service Wait Class Stats").unwrap(),
-    ];
+let stop_patterns = vec![
+    Regex::new(r"^Main Report").unwrap(),
+    Regex::new(r"^Back to Top").unwrap(),
+    Regex::new(r"^Wait Events Statistics").unwrap(),
+    Regex::new(r"^Instance Activity").unwrap(),
+    Regex::new(r"^SQL Statistics").unwrap(),
+    Regex::new(r"^Undo Statistics").unwrap(),
+    Regex::new(r"^Segment Statistics").unwrap(),
+    Regex::new(r"^Library Cache Statistics").unwrap(),
+    Regex::new(r"^Initialization Parameters").unwrap(),
+    Regex::new(r"^ADDM Reports").unwrap(),
+    Regex::new(r"^Top Process Types").unwrap(),
+    Regex::new(r"^Service Statistics").unwrap(),
+    Regex::new(r"^Service Wait Class Stats").unwrap(),
+    // *** Add these lines ***
+    Regex::new(r"^Wait Classes by Total Wait Time").unwrap(),
+    Regex::new(r"^IO Profile").unwrap(),
+];
 
     let mut start_idx = None;
+
     for (i, line) in lines.iter().enumerate() {
         if section_pat.is_match(line) {
             start_idx = Some(i);
             break;
         }
     }
-    let start = start_idx?;
 
-    let mut table: Vec<String> = Vec::new();
+    let start = start_idx?;
+    let mut table = Vec::new();
     let mut started = false;
     let mut gap = 0;
 
@@ -141,19 +206,44 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
     }
 }
 
-/// Extracts the percentage column from a wait-event table row,
-/// just before the "Wait Class" (last word).
+/// Extracts % DB Time from table rows
 fn extract_percent_from_wait_row(row: &str) -> Option<f64> {
     let parts: Vec<&str> = row.split_whitespace().collect();
     if parts.len() < 2 {
         return None;
     }
+
     for i in (1..parts.len()).rev() {
         if parts[i].chars().all(|c| c.is_alphabetic() || c == '/') && i > 0 {
-            if let Ok(val) = parts[i - 1].replace(',', "").parse::<f64>() {
-                return Some(val);
+            if let Ok(v) = parts[i - 1].replace(',', "").parse::<f64>() {
+                return Some(v);
             }
         }
+    }
+    None
+}
+
+/* ============================================================================
+   NEW: LATENCY EXTRACTION (ms) FROM THE "Avg Wait" COLUMN
+   Handles:
+     212.99us  → 0.212ms
+     9.27ms    → 9.27ms
+     .99ms     → 0.99ms
+     3252.59ms → 3252.59ms
+   ============================================================================
+*/
+fn extract_latency_ms(row: &str) -> Option<f64> {
+    let re = Regex::new(r"(\d*\.?\d+)(ms|us)").unwrap();
+
+    if let Some(cap) = re.captures(row) {
+        let val: f64 = cap[1].parse().ok()?;
+        let unit = &cap[2];
+
+        return Some(match unit {
+            "us" => val / 1000.0, // convert microseconds → milliseconds
+            "ms" => val,
+            _ => return None,
+        });
     }
     None
 }
@@ -162,7 +252,9 @@ fn extract_percent_from_wait_row(row: &str) -> Option<f64> {
 
 fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
+
     for row in table {
+        // % wait time alerts
         if row.contains("log file sync") && row.contains("Commit") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
                 if pct > t.wait_pct {
@@ -173,6 +265,7 @@ fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String> {
                 }
             }
         }
+
         if row.contains("db file sequential read") && row.contains("User I/O") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
                 if pct > t.wait_pct {
@@ -183,70 +276,91 @@ fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String> {
                 }
             }
         }
-        // Example: add row lock and GC checks using t.row_lock_pct/t.gc_remote_pct
+
+        /* ============================================================
+           NEW: AVG WAIT LATENCY CHECK — uses t.io_latency_ms threshold
+           ============================================================ */
+        if let Some(lat) = extract_latency_ms(row) {
+            if lat > t.io_latency_ms {
+                alerts.push(format!(
+                    "🔴 ALERT: High I/O latency {:.2}ms (> {}ms threshold)",
+                    lat, t.io_latency_ms
+                ));
+            }
+        }
+
+        // Row lock %
         if row.contains("row lock contention") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
                 if pct > t.row_lock_pct {
                     alerts.push(format!(
-                        "🔴 Row lock contention {:.1}% — investigate for blocking DML.",
+                        "🔴 Row lock contention {:.1}% — investigate blocking.",
                         pct
                     ));
                 }
             }
         }
+
+        // GC Remote %
         if row.to_lowercase().contains("gc") && row.to_lowercase().contains("remote") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
                 if pct > t.gc_remote_pct {
                     alerts.push(format!(
-                        "🔴 High GC remote transfer {:.1}% — possible RAC interconnect issues.",
+                        "🔴 High GC remote {:.1}% — possible RAC interconnect issue.",
                         pct
                     ));
                 }
             }
         }
+
         if row.contains("buffer busy waits") {
-            alerts.push("🟠 NOTICE: 'buffer busy waits' — hot blocks / buffer cache contention."
-                .to_string());
+            alerts.push("🟠 NOTICE: buffer busy waits — hot blocks likely.".into());
         }
+
         if row.contains("direct path write temp") {
-            alerts.push("🟡 Temp I/O — check temp tablespace usage.".to_string());
+            alerts.push("🟡 Temp I/O — heavy temp usage.".into());
         }
     }
+
     alerts
 }
 
 fn alert_on_wait_classes(table: &[String], t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
+
     for row in table {
         if row.contains("User I/O") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
                 if pct > t.wait_pct {
-                    alerts.push("🟡 NOTICE: User I/O wait class high — database is I/O-bound.".into());
+                    alerts.push("🟡 NOTICE: User I/O class high — DB is I/O-bound.".into());
                 }
             }
         }
+
         if row.contains("Commit") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
                 if pct > t.wait_pct {
-                    alerts.push("🟠 Commit class high — commit rate or redo bottleneck.".into());
+                    alerts.push("🟠 Commit wait class elevated — redo pressure.".into());
                 }
             }
         }
     }
+
     alerts
 }
 
 fn alert_on_io_profile(table: &[String], _t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
-    let num_re = Regex::new(r"(\d[\d,\.]*)").unwrap();
+    let num_re = Regex::new(r"(\d[\d,\.]+)").unwrap();
+
     for l in table {
         if l.contains("Total Requests:") {
-            let nums: Vec<f64> = num_re
-                .captures_iter(l)
+            let vals: Vec<f64> = num_re.captures_iter(l)
                 .filter_map(|c| c[1].replace(',', "").parse().ok())
                 .collect();
-            if let Some(v) = nums.first() {
-                if *v > 10_000.0 {
+
+            if let Some(first) = vals.first() {
+                if *first > 10_000.0 {
                     alerts.push("🟠 Very high I/O request rate.".into());
                 }
             }
@@ -254,6 +368,9 @@ fn alert_on_io_profile(table: &[String], _t: &AlertThresholds) -> Vec<String> {
     }
     alerts
 }
+
+
+/* -------------------- OUTPUT -------------------- */
 
 fn print_table_with_alert<F>(
     lines: &[String],
@@ -271,7 +388,9 @@ where
         for l in &table {
             println!("{}", l);
         }
+
         let alerts = alert_fn(&table, thresholds);
+
         if alerts.is_empty() {
             println!("\nNo immediate I/O issues flagged.\n");
         } else {
@@ -286,13 +405,16 @@ where
     }
 }
 
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         usage();
     }
+
     let filename = &args[1];
     let config_path = if args.len() >= 3 { &args[2] } else { "awr_io_analyze.toml" };
+
     let thresholds = load_thresholds_from_file(config_path);
     let lines = read_lines(filename);
 
@@ -306,6 +428,7 @@ fn main() {
         alert_on_fg_waits,
         &thresholds,
     );
+
     print_table_with_alert(
         &lines,
         r"Wait Classes by Total Wait Time",
@@ -313,6 +436,7 @@ fn main() {
         alert_on_wait_classes,
         &thresholds,
     );
+
     print_table_with_alert(
         &lines,
         r"IO Profile",
@@ -320,11 +444,12 @@ fn main() {
         alert_on_io_profile,
         &thresholds,
     );
+
     println!("## Knowledge Base / Best Practices");
-    println!("- log file sync: redo log bottleneck.");
-    println!("- db file sequential read: random I/O latency.");
+    println!("- log file sync: redo bottleneck.");
+    println!("- db file sequential read: random I/O slowness.");
     println!("- buffer busy waits: hot blocks.");
-    println!("- High User I/O: DB is storage-bound.");
-    println!("- Always correlate waits with SQL + storage behavior.\n");
+    println!("- High User I/O: storage-bound workload.");
+    println!("- Always correlate waits with SQL + I/O subsystem.\n");
 }
 
