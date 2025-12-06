@@ -3,3 +3,4 @@ wait_pct = 10.0
 io_latency_ms = 20.0
 row_lock_pct = 3.0
 gc_remote_pct = 2.0
+io_request_rate = 10_000.0

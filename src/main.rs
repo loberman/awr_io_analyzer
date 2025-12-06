@@ -104,6 +104,18 @@ Oracle AWR I/O Analyzer (Rust)
 Usage:
   awr_io_analyze <awrrpt_xxx.txt> [config.toml]
 
+  Note!! This only works with per-node AWR reports not global reports
+  Make sure you ask for per-node AWR reports
+   
+  For the config.toml to override the default the file you create
+  looks like this with your own values replaced.
+  
+ # awr_io_analyze.toml — threshold config for AWR I/O Analyzer
+wait_pct = 10.0
+io_latency_ms = 20.0
+row_lock_pct = 3.0
+gc_remote_pct = 2.0
+
 Developed by Laurence Oberman, assisted by ChatGPT (OpenAI), 2025
 ");
     process::exit(1);
@@ -395,7 +407,7 @@ fn alert_on_wait_classes(table: &[String], t: &AlertThresholds) -> Vec<String> {
     alerts
 }
 
-fn alert_on_io_profile(table: &[String], _t: &AlertThresholds) -> Vec<String> {
+fn alert_on_io_profile(table: &[String], t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
     let num_re = Regex::new(r"(\d[\d,\.]+)").unwrap();
 
@@ -406,8 +418,9 @@ fn alert_on_io_profile(table: &[String], _t: &AlertThresholds) -> Vec<String> {
                 .collect();
 
             if let Some(first) = vals.first() {
-                if *first > 10_000.0 {
-                    alerts.push("🟠 Very high I/O request rate.".into());
+                if *first > t.io_request_rate {
+                    println!("DEBUG: io_request_rate value = {} check value = {}",*first,t.io_request_rate);
+                    alerts.push("🟠 High I/O request rate.".into());
                 }
             }
         }
@@ -459,7 +472,9 @@ fn main() {
     }
 
     let filename = &args[1];
+    //println!("DEBUG: args.len = {} config args = {}",args.len(),&args[2]);
     let config_path = if args.len() >= 3 { &args[2] } else { "awr_io_analyze.toml" };
+    //println!("DEBUG: config_path = {}",config_path);
 
     let thresholds = load_thresholds_from_file(config_path);
     let lines = read_lines(filename);

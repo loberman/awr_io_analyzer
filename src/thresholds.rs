@@ -19,6 +19,7 @@ pub struct AlertThresholds {
     pub row_lock_pct: f64,    // Row lock contention % (default: 3.0)
     pub gc_remote_pct: f64,   // GC remote transfer % (default: 2.0)
     // Add more thresholds below as needed!
+    pub io_request_rate: f64, // i/o request rate from io_profile view
 }
 
 /// Defaults used if no config file or missing values.
@@ -29,6 +30,7 @@ impl Default for AlertThresholds {
             io_latency_ms: 20.0,
             row_lock_pct: 3.0,
             gc_remote_pct: 2.0,
+            io_request_rate: 10_000.0,
         }
     }
 }
@@ -61,6 +63,7 @@ pub fn load_thresholds_from_file(path: &str) -> AlertThresholds {
                 "io_latency_ms" => t.io_latency_ms = parts[1].parse().unwrap_or(t.io_latency_ms),
                 "row_lock_pct" => t.row_lock_pct = parts[1].parse().unwrap_or(t.row_lock_pct),
                 "gc_remote_pct" => t.gc_remote_pct = parts[1].parse().unwrap_or(t.gc_remote_pct),
+                "io_request_rate" => t.io_request_rate = parts[1].parse().unwrap_or(t.io_request_rate),
                 _ => {},
             }
         }
