@@ -248,12 +248,55 @@ fn extract_latency_ms(row: &str) -> Option<f64> {
     None
 }
 
+fn extract_event_name(row: &str) -> String {
+    // Normalize all whitespace: tabs and weird unicode spaces from HTML->txt
+    let mut clean = row.replace('\t', " ");
+    for ws in ['\u{00A0}', '\u{2007}', '\u{202F}'] {
+        clean = clean.replace(ws, " ");
+    }
+
+    // Split by *2 or more* spaces (AWR column boundary is usually 2+ spaces!)
+    let re = Regex::new(r" {2,}").unwrap();
+    let mut split = re.split(clean.trim());
+    if let Some(event) = split.next() {
+        if !event.trim().is_empty() {
+            return event
+                .trim()
+                .to_lowercase()
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+                .replace("__", "_")
+                .trim_matches('_')
+                .to_string();
+        }
+    }
+
+    // fallback: grab all up to first digit (start of "Waits" column)
+    let mut event = String::new();
+    for c in clean.chars() {
+        if c.is_numeric() { break; }
+        event.push(c);
+    }
+    if !event.trim().is_empty() {
+        return event
+            .trim()
+            .to_lowercase()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+            .replace("__", "_")
+            .trim_matches('_')
+            .to_string();
+    }
+
+    "unknown".to_string()
+}
+
+
 /* -------------------- ALERT LOGIC -------------------- */
 
 fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
 
     for row in table {
+
         // % wait time alerts
         if row.contains("log file sync") && row.contains("Commit") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
@@ -277,19 +320,21 @@ fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String> {
             }
         }
 
-        /* ============================================================
-           NEW: AVG WAIT LATENCY CHECK — uses t.io_latency_ms threshold
-           ============================================================ */
+        // === AVG WAIT LATENCY CHECK (with FULL metric annotation) ===
         if let Some(lat) = extract_latency_ms(row) {
             if lat > t.io_latency_ms {
+
+                let metric_full = extract_event_name(row);
+
                 alerts.push(format!(
-                    "🔴 ALERT: High I/O latency {:.2}ms (> {}ms threshold)",
-                    lat, t.io_latency_ms
+                    "🔴 ALERT: High I/O latency {:.2}ms (> {}ms threshold) <----- {}",
+                    lat, t.io_latency_ms, metric_full
                 ));
             }
         }
 
-        // Row lock %
+
+        // Row lock % (rare but let's keep it explicit)
         if row.contains("row lock contention") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
                 if pct > t.row_lock_pct {
@@ -324,6 +369,7 @@ fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String> {
 
     alerts
 }
+
 
 fn alert_on_wait_classes(table: &[String], t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
