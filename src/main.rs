@@ -6,7 +6,7 @@
  * actionable expert comments and problem alerts underneath.
  *
  * Usage:
- *   awr_io_analyze <awrrpt_xxx.txt>
+ *   awr_io_analyze <awrrpt_xxx.txt> [config.toml]
  *
  * - Reads any Oracle AWR text report (plain or HTML-to-txt)
  * - Extracts and prints the three key I/O tables, as formatted in the report:
@@ -20,6 +20,8 @@
  * License: GPLv3+
  */
 
+mod thresholds;
+use thresholds::{AlertThresholds, load_thresholds_from_file};
 use regex::Regex;
 use std::env;
 use std::fs;
@@ -32,10 +34,11 @@ Oracle AWR I/O Analyzer (Rust)
 ------------------------------
 
 Usage:
-  awr_io_analyze <awrrpt_xxx.txt>
+  awr_io_analyze <awrrpt_xxx.txt> [config.toml]
 
 Example:
   awr_io_analyze awrrpt_1_67450_67453_RMS.html.txt
+  awr_io_analyze awrrpt_1_67450_67453_RMS.html.txt custom_thresholds.toml
 
 - Reads an AWR text report and prints I/O tables with alerts/comments
 - Output: Original AWR tables + expert analysis under each table
@@ -46,9 +49,6 @@ Developed by Laurence Oberman, assisted by ChatGPT (OpenAI), 2025
 }
 
 /// Read file into vector of String, one per line.
-///
-/// # Arguments
-/// * `path` — Path to the file to read
 fn read_lines(path: &str) -> Vec<String> {
     fs::read_to_string(path)
         .expect("Failed to read file")
@@ -58,21 +58,11 @@ fn read_lines(path: &str) -> Vec<String> {
 }
 
 /// Extract a native AWR table (exactly as printed) into Vec<String>.
-///
-/// Searches for the section header, skips navigation/menu lines,
-/// and captures all table lines until either too many consecutive
-/// blanks or a known unrelated section is encountered.
-///
-/// # Arguments
-/// * `lines` — Slice of the report as strings
-/// * `section_title` — Regex pattern for the table section header
-/// * `max_gap` — How many consecutive blanks end a table
 fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
     -> Option<Vec<String>>
 {
     let section_pat = Regex::new(section_title).unwrap();
 
-    // List of patterns that mark a *new unrelated section* (not part of the table)
     let stop_patterns = vec![
         Regex::new(r"^Main Report").unwrap(),
         Regex::new(r"^Back to Top").unwrap(),
@@ -89,7 +79,6 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
         Regex::new(r"^Service Wait Class Stats").unwrap(),
     ];
 
-    // 1. Find the start of the section
     let mut start_idx = None;
     for (i, line) in lines.iter().enumerate() {
         if section_pat.is_match(line) {
@@ -99,7 +88,6 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
     }
     let start = start_idx?;
 
-    // 2. Scan forward to extract table lines, handling blanks and dash-lines
     let mut table: Vec<String> = Vec::new();
     let mut started = false;
     let mut gap = 0;
@@ -107,12 +95,10 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
     for l in &lines[start + 1..] {
         let trim = l.trim();
 
-        // End if we hit an unrelated section header
         if stop_patterns.iter().any(|p| p.is_match(trim)) {
             break;
         }
 
-        // Skip navigation menu lines (e.g., "- Wait Events", or "Report Summary:")
         if Regex::new(r"^\s*-\s+").unwrap().is_match(l)
             || Regex::new(r"^[A-Z][A-Za-z\s]+:$").unwrap().is_match(trim)
         {
@@ -123,7 +109,6 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
             }
         }
 
-        // Handle blank lines (for end of table detection)
         if trim.is_empty() {
             if started {
                 gap += 1;
@@ -134,7 +119,6 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
             continue;
         }
 
-        // Horizontal dashed lines are part of table formatting
         if trim.chars().all(|c| c == '-' || c == '–' || c == '—') {
             if started {
                 table.push(l.clone());
@@ -142,7 +126,6 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
             continue;
         }
 
-        // Start table after first non-blank, non-nav line
         if !started {
             started = true;
         }
@@ -160,18 +143,11 @@ fn extract_native_table(lines: &[String], section_title: &str, max_gap: usize)
 
 /// Extracts the percentage column from a wait-event table row,
 /// just before the "Wait Class" (last word).
-///
-/// Example row:
-///   "log file sync   232,142   2151.6   9.27ms   7.0 Commit"
-/// Will find and parse "7.0" (the percent) as f64.
-///
-/// Returns None if not found.
 fn extract_percent_from_wait_row(row: &str) -> Option<f64> {
     let parts: Vec<&str> = row.split_whitespace().collect();
     if parts.len() < 2 {
         return None;
     }
-    // Walk backwards: if current is alpha and previous parses as float, that's the percent
     for i in (1..parts.len()).rev() {
         if parts[i].chars().all(|c| c.is_alphabetic() || c == '/') && i > 0 {
             if let Ok(val) = parts[i - 1].replace(',', "").parse::<f64>() {
@@ -184,15 +160,12 @@ fn extract_percent_from_wait_row(row: &str) -> Option<f64> {
 
 /* -------------------- ALERT LOGIC -------------------- */
 
-/// Alert logic for Foreground Wait Events table.
-/// Flags high log file sync, db file sequential read, buffer busy waits, etc.
-fn alert_on_fg_waits(table: &[String]) -> Vec<String> {
+fn alert_on_fg_waits(table: &[String], t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
-
     for row in table {
         if row.contains("log file sync") && row.contains("Commit") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
-                if pct > 5.0 {
+                if pct > t.wait_pct {
                     alerts.push(format!(
                         "🔴 ALERT: High 'log file sync' {:.1}% — redo/commit bottleneck likely.",
                         pct
@@ -202,9 +175,30 @@ fn alert_on_fg_waits(table: &[String]) -> Vec<String> {
         }
         if row.contains("db file sequential read") && row.contains("User I/O") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
-                if pct > 5.0 {
+                if pct > t.wait_pct {
                     alerts.push(format!(
                         "🟠 NOTICE: High 'db file sequential read' {:.1}% — slow random I/O.",
+                        pct
+                    ));
+                }
+            }
+        }
+        // Example: add row lock and GC checks using t.row_lock_pct/t.gc_remote_pct
+        if row.contains("row lock contention") {
+            if let Some(pct) = extract_percent_from_wait_row(row) {
+                if pct > t.row_lock_pct {
+                    alerts.push(format!(
+                        "🔴 Row lock contention {:.1}% — investigate for blocking DML.",
+                        pct
+                    ));
+                }
+            }
+        }
+        if row.to_lowercase().contains("gc") && row.to_lowercase().contains("remote") {
+            if let Some(pct) = extract_percent_from_wait_row(row) {
+                if pct > t.gc_remote_pct {
+                    alerts.push(format!(
+                        "🔴 High GC remote transfer {:.1}% — possible RAC interconnect issues.",
                         pct
                     ));
                 }
@@ -214,53 +208,43 @@ fn alert_on_fg_waits(table: &[String]) -> Vec<String> {
             alerts.push("🟠 NOTICE: 'buffer busy waits' — hot blocks / buffer cache contention."
                 .to_string());
         }
-
         if row.contains("direct path write temp") {
             alerts.push("🟡 Temp I/O — check temp tablespace usage.".to_string());
         }
     }
-
     alerts
 }
 
-/// Alert logic for Wait Classes table.
-/// Flags high "User I/O" (DB is I/O bound), high "Commit" class, etc.
-fn alert_on_wait_classes(table: &[String]) -> Vec<String> {
+fn alert_on_wait_classes(table: &[String], t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
-
     for row in table {
         if row.contains("User I/O") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
-                if pct > 15.0 {
+                if pct > t.wait_pct {
                     alerts.push("🟡 NOTICE: User I/O wait class high — database is I/O-bound.".into());
                 }
             }
         }
         if row.contains("Commit") {
             if let Some(pct) = extract_percent_from_wait_row(row) {
-                if pct > 5.0 {
+                if pct > t.wait_pct {
                     alerts.push("🟠 Commit class high — commit rate or redo bottleneck.".into());
                 }
             }
         }
     }
-
     alerts
 }
 
-/// Alert logic for IO Profile table.
-/// Highlights if total I/O request rate is unusually high.
-fn alert_on_io_profile(table: &[String]) -> Vec<String> {
+fn alert_on_io_profile(table: &[String], _t: &AlertThresholds) -> Vec<String> {
     let mut alerts = Vec::new();
     let num_re = Regex::new(r"(\d[\d,\.]*)").unwrap();
-
     for l in table {
         if l.contains("Total Requests:") {
             let nums: Vec<f64> = num_re
                 .captures_iter(l)
                 .filter_map(|c| c[1].replace(',', "").parse().ok())
                 .collect();
-
             if let Some(v) = nums.first() {
                 if *v > 10_000.0 {
                     alerts.push("🟠 Very high I/O request rate.".into());
@@ -268,34 +252,26 @@ fn alert_on_io_profile(table: &[String]) -> Vec<String> {
             }
         }
     }
-
     alerts
 }
 
-/* -------------------- OUTPUT -------------------- */
-
-/// Print a table with its section heading, then analyze and print alerts underneath.
-/// If section not found, prints a notice.
-///
-/// # Arguments
-/// * `lines`      — Full report as slice of lines
-/// * `title_pat`  — Regex for table header to extract
-/// * `section_name` — Label for section heading in output
-/// * `alert_fn`   — Function to call for alert logic
-fn print_table_with_alert(
+fn print_table_with_alert<F>(
     lines: &[String],
     title_pat: &str,
     section_name: &str,
-    alert_fn: fn(&[String]) -> Vec<String>,
-) {
+    alert_fn: F,
+    thresholds: &AlertThresholds,
+)
+where
+    F: Fn(&[String], &AlertThresholds) -> Vec<String>,
+{
     println!("## {}\n", section_name);
 
     if let Some(table) = extract_native_table(lines, title_pat, 2) {
         for l in &table {
             println!("{}", l);
         }
-
-        let alerts = alert_fn(&table);
+        let alerts = alert_fn(&table, thresholds);
         if alerts.is_empty() {
             println!("\nNo immediate I/O issues flagged.\n");
         } else {
@@ -310,39 +286,40 @@ fn print_table_with_alert(
     }
 }
 
-/// Entry point: parses command line, reads file, and runs all analysis/reporting.
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
+    if args.len() < 2 {
         usage();
     }
-
     let filename = &args[1];
+    let config_path = if args.len() >= 3 { &args[2] } else { "awr_io_analyze.toml" };
+    let thresholds = load_thresholds_from_file(config_path);
     let lines = read_lines(filename);
 
     println!("# AWR I/O Analysis for `{}`\n", filename);
+    println!("**Thresholds: {:?}**\n", thresholds);
 
     print_table_with_alert(
         &lines,
         r"Top 10 Foreground Events by Total Wait Time",
         "Foreground Wait Events",
         alert_on_fg_waits,
+        &thresholds,
     );
-
     print_table_with_alert(
         &lines,
         r"Wait Classes by Total Wait Time",
         "Wait Classes",
         alert_on_wait_classes,
+        &thresholds,
     );
-
     print_table_with_alert(
         &lines,
         r"IO Profile",
         "IO Profile",
         alert_on_io_profile,
+        &thresholds,
     );
-
     println!("## Knowledge Base / Best Practices");
     println!("- log file sync: redo log bottleneck.");
     println!("- db file sequential read: random I/O latency.");

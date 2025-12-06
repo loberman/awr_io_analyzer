@@ -1,0 +1,5 @@
+wait_pct = 10.0
+io_latency_ms = 20.0
+row_lock_pct = 5.0
+gc_remote_pct = 10.0
+
